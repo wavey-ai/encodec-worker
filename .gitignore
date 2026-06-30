@@ -1,0 +1,19 @@
+__pycache__
+.wrangler
+.DS_Store
+.secrets
+cdp_api_key.json
+node_modules/
+.venv*/
+target/
+dist/
+wasm/
+.cache/
+.wasm-pack-build.lock/
+.cache-local/
+.tmp-local/
+*.local.ecdc
+*.local.wav
+
+# Local scratch (screenshots, debug scripts)
+/tmp/

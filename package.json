@@ -1,0 +1,15 @@
+{
+  "name": "encodec-worker",
+  "private": true,
+  "scripts": {
+    "build": "wrangler deploy --dry-run --outdir dist",
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy"
+  },
+  "dependencies": {
+    "onnxruntime-web": "^1.22.0"
+  },
+  "devDependencies": {
+    "wrangler": "^4.0.0"
+  }
+}

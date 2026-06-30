@@ -1,0 +1,12 @@
+name = "encodec-worker"
+main = "build/worker/shim.mjs"
+compatibility_date = "2026-06-30"
+
+[build]
+command = "cargo install -q worker-build && worker-build --release"
+
+[limits]
+cpu_ms = 30000
+
+[vars]
+ALLOWED_ORIGINS = "http://localhost:8788"
