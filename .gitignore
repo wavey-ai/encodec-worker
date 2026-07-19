@@ -7,6 +7,7 @@ node_modules/
 .venv*/
 target/
 dist/
+dist-vps/
 wasm/
 .cache/
 .wasm-pack-build.lock/

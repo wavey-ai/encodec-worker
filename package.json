@@ -3,6 +3,10 @@
   "private": true,
   "scripts": {
     "build": "wrangler deploy --dry-run --outdir dist",
+    "build:vps": "node scripts/build-vps.mjs",
+    "check:vps": "node --check server/main.mjs && node --check server/encode-worker.mjs && node --check scripts/build-vps.mjs && node --check scripts/test-vps.mjs && node --check scripts/test-vps-queue.mjs",
+    "start:vps": "node dist-vps/server/main.mjs",
+    "test:vps": "node scripts/test-vps.mjs && node scripts/test-vps-queue.mjs",
     "dev": "wrangler dev",
     "deploy": "wrangler deploy"
   },

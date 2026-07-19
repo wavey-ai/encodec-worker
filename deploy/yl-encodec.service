@@ -1,0 +1,23 @@
+[Unit]
+Description=YL remote EnCodec CPU worker
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=yl-encodec
+Group=yl-encodec
+WorkingDirectory=/opt/yl-encodec
+EnvironmentFile=/etc/yl-encodec.env
+ExecStart=/usr/bin/node /opt/yl-encodec/server/main.mjs
+Restart=always
+RestartSec=3
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=full
+ReadWritePaths=/opt/yl-encodec
+LimitNOFILE=65535
+
+[Install]
+WantedBy=multi-user.target

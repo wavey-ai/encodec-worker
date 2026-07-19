@@ -1,5 +1,5 @@
 use std::cell::RefCell;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
 use encodec_rs::wasm::{lm_ecdc_chunk_from_frame, lm_ecdc_fixed_header_for_weights};
@@ -12,24 +12,60 @@ use sha2::{Digest, Sha256};
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
 use wasm_bindgen_futures::JsFuture;
-use worker::{
-    console_error, event, Context, Env, Headers, Method, Request, Response, Result, Router,
+#[cfg(feature = "standalone")]
+use worker::{event, Context};
+use worker::{console_error, Env, Headers, Method, Request, Response, Result, Router};
+
+const SAMPLE_RATE: u32 = 48_000;
+const CHANNELS: usize = 2;
+const CONTEXT_SAMPLES: usize = 480;
+const MAX_BODY_BYTES: usize = 1024 * 1024;
+const BITSTREAM_VERSION: u8 = 2;
+const DEFAULT_PROFILE: &str = "encodec_48khz_12kbps_1800ms";
+const SOUNDKIT_V2_MAGIC: u32 = 0x2b;
+const SOUNDKIT_V2_VERSION: u32 = 2;
+const SOUNDKIT_V2_ENCODING_OPUS: u32 = 2;
+const SOUNDKIT_V2_FLAG_ID_PRESENT: u32 = 1 << 0;
+const SOUNDKIT_V2_FLAG_ID_U64: u32 = 1 << 1;
+const SOUNDKIT_V2_FLAG_PTS_PRESENT: u32 = 1 << 2;
+const SOUNDKIT_V2_FLAG_EXTENDED_SIZES: u32 = 1 << 5;
+const SOUNDKIT_V2_SAMPLE_RATES: [u32; 11] = [
+    8_000, 12_000, 16_000, 24_000, 32_000, 44_100, 48_000, 88_200, 96_000, 176_400, 192_000,
+];
+
+struct ProfileSpec {
+    name: &'static str,
+    owned_samples: usize,
+    model_samples: usize,
+    frame_length: usize,
+    bundle_json: &'static str,
+    model_bytes: &'static [u8],
+    lm_weights: &'static [u8],
+}
+
+const PROFILE_1333: ProfileSpec = ProfileSpec {
+    name: "encodec_48khz_12kbps_1333ms",
+    owned_samples: 64_000,
+    model_samples: 64_960,
+    frame_length: 203,
+    bundle_json: include_str!("../wasm/encodec_48khz_12kbps_1333ms/bundle.json"),
+    model_bytes: include_bytes!("../wasm/encodec_48khz_12kbps_1333ms/encode_frame.onnx"),
+    lm_weights: include_bytes!("../wasm/encodec_48khz_12kbps_1333ms/lm_weights_q8.bin"),
 };
 
-const PROFILE: &str = "encodec_48khz_12kbps_1800ms";
-const SAMPLE_RATE: u32 = 48_000;
-const CHANNELS: usize = 1;
-const EXPECTED_FRAMES: usize = 86_400;
-const MAX_BODY_BYTES: usize = 512 * 1024;
-const BITSTREAM_VERSION: u8 = 2;
-const BUNDLE_JSON: &str = include_str!("../assets/encodec_48khz_12kbps_1800ms/bundle.json");
-const MODEL_BYTES: &[u8] =
-    include_bytes!("../assets/encodec_48khz_12kbps_1800ms/encode_frame.onnx");
-const LM_WEIGHTS: &[u8] = include_bytes!("../assets/encodec_48khz_12kbps_1800ms/lm_weights_q8.bin");
+const PROFILE_1800: ProfileSpec = ProfileSpec {
+    name: "encodec_48khz_12kbps_1800ms",
+    owned_samples: 86_400,
+    model_samples: 87_360,
+    frame_length: 273,
+    bundle_json: include_str!("../wasm/encodec_48khz_12kbps_1800ms/bundle.json"),
+    model_bytes: include_bytes!("../wasm/encodec_48khz_12kbps_1800ms/encode_frame.onnx"),
+    lm_weights: include_bytes!("../wasm/encodec_48khz_12kbps_1800ms/lm_weights_q8.bin"),
+};
 
 thread_local! {
-    static RUNTIME: RefCell<Option<Rc<Runtime>>> = const { RefCell::new(None) };
-    static RUNTIME_PROMISE: RefCell<Option<Promise>> = const { RefCell::new(None) };
+    static RUNTIMES: RefCell<HashMap<&'static str, Rc<Runtime>>> = RefCell::new(HashMap::new());
+    static RUNTIME_PROMISES: RefCell<HashMap<&'static str, Promise>> = RefCell::new(HashMap::new());
 }
 
 #[wasm_bindgen(module = "onnxruntime-web/wasm")]
@@ -79,8 +115,13 @@ struct ReadyBody<'a> {
     runtime_reused: bool,
 }
 
+#[cfg(feature = "standalone")]
 #[event(fetch)]
 pub async fn fetch(request: Request, env: Env, _ctx: Context) -> Result<Response> {
+    handle_fetch(request, env).await
+}
+
+pub async fn handle_fetch(request: Request, env: Env) -> Result<Response> {
     console_error_panic_hook::set_once();
     Router::new()
         .get("/health", |_, _| {
@@ -92,8 +133,8 @@ pub async fn fetch(request: Request, env: Env, _ctx: Context) -> Result<Response
         .get_async("/ready", |request, ctx| async move {
             ready(request, ctx.env).await
         })
-        .options("/encode/ecdc", |request, ctx| preflight(&request, &ctx.env))
-        .post_async("/encode/ecdc", |request, ctx| async move {
+        .options("/encode", |request, ctx| preflight(&request, &ctx.env))
+        .post_async("/encode", |request, ctx| async move {
             encode(request, ctx.env).await
         })
         .run(request, env)
@@ -102,6 +143,17 @@ pub async fn fetch(request: Request, env: Env, _ctx: Context) -> Result<Response
 
 async fn ready(request: Request, env: Env) -> Result<Response> {
     let request_id = random_id();
+    let profile =
+        match requested_profile(&request) {
+            Some(profile) => profile,
+            None => return error_response(
+                "unsupported_profile",
+                "Only encodec_48khz_12kbps_1333ms and encodec_48khz_12kbps_1800ms are supported.",
+                422,
+                &request_id,
+                None,
+            ),
+        };
     let cors = match cors_headers(&request, &env)? {
         Some(headers) => headers,
         None => {
@@ -114,12 +166,12 @@ async fn ready(request: Request, env: Env) -> Result<Response> {
             )
         }
     };
-    let reused = runtime_exists();
-    match get_runtime().await {
+    let reused = runtime_exists(profile.name);
+    match get_runtime(profile).await {
         Ok(runtime) => {
             let mut response = Response::from_json(&ReadyBody {
                 ok: true,
-                profile: PROFILE,
+                profile: profile.name,
                 runtime_instance: &runtime.instance_id,
                 runtime_reused: reused,
             })?;
@@ -192,32 +244,30 @@ async fn encode(mut request: Request, env: Env) -> Result<Response> {
         .to_ascii_lowercase();
     if content_type != "application/octet-stream"
         && content_type != "application/vnd.soundkit.opus-packets"
+        && content_type != "application/vnd.soundkit.opus-stream"
+        && content_type != "application/vnd.soundkit.v2.opus-stream"
     {
         return error_response(
             "unsupported_content_type",
-            "Expected a SoundKit Opus packet bundle.",
+            "Expected a SoundKit Opus stream.",
             415,
             &request_id,
             Some(cors),
         );
     }
 
-    let profile = request
-        .headers()
-        .get("X-Encodec-Profile")?
-        .unwrap_or_else(|| PROFILE.to_string());
-    if profile != PROFILE {
+    let Some(profile) = requested_profile(&request) else {
         return error_response(
             "unsupported_profile",
-            "Only encodec_48khz_12kbps_1800ms is supported.",
+            "Only encodec_48khz_12kbps_1333ms and encodec_48khz_12kbps_1800ms are supported.",
             422,
             &request_id,
             Some(cors),
         );
-    }
+    };
 
     for (name, expected) in [
-        ("X-Encodec-Expected-Samples", EXPECTED_FRAMES),
+        ("X-Encodec-Expected-Samples", profile.owned_samples),
         ("X-Encodec-Sample-Rate", SAMPLE_RATE as usize),
         ("X-Encodec-Channels", CHANNELS),
     ] {
@@ -266,8 +316,8 @@ async fn encode(mut request: Request, env: Env) -> Result<Response> {
         );
     }
 
-    let reused = runtime_exists();
-    let runtime = match get_runtime().await {
+    let reused = runtime_exists(profile.name);
+    let runtime = match get_runtime(profile).await {
         Ok(runtime) => runtime,
         Err(error) => {
             console_error!("request {} runtime error: {:?}", request_id, error);
@@ -282,7 +332,7 @@ async fn encode(mut request: Request, env: Env) -> Result<Response> {
     };
 
     let started = js_sys::Date::now();
-    let pcm = match decode_packet_bundle(&body) {
+    let owned_pcm = match decode_soundkit_opus_stream(&body, profile) {
         Ok(pcm) => pcm,
         Err(error) => {
             console_error!("request {} opus error: {}", request_id, error);
@@ -295,9 +345,10 @@ async fn encode(mut request: Request, env: Env) -> Result<Response> {
             );
         }
     };
+    let pcm = add_fixed_context(&owned_pcm, profile);
     let decoded_at = js_sys::Date::now();
 
-    let (codes, scale, frame_length) = match run_inference(&runtime.session, &pcm).await {
+    let (codes, scale, frame_length) = match run_inference(&runtime.session, &pcm, profile).await {
         Ok(output) => output,
         Err(error) => {
             console_error!("request {} inference error: {:?}", request_id, error);
@@ -313,10 +364,10 @@ async fn encode(mut request: Request, env: Env) -> Result<Response> {
     let inferred_at = js_sys::Date::now();
 
     let mut ecdc = match lm_ecdc_fixed_header_for_weights(
-        BUNDLE_JSON,
-        EXPECTED_FRAMES,
+        profile.bundle_json,
+        profile.owned_samples,
         BITSTREAM_VERSION,
-        LM_WEIGHTS,
+        profile.lm_weights,
     ) {
         Ok(bytes) => bytes,
         Err(error) => {
@@ -330,8 +381,13 @@ async fn encode(mut request: Request, env: Env) -> Result<Response> {
             );
         }
     };
-    let chunk = match lm_ecdc_chunk_from_frame(BUNDLE_JSON, LM_WEIGHTS, scale, &codes, frame_length)
-    {
+    let chunk = match lm_ecdc_chunk_from_frame(
+        profile.bundle_json,
+        profile.lm_weights,
+        scale,
+        &codes,
+        frame_length,
+    ) {
         Ok(bytes) => bytes,
         Err(error) => {
             console_error!("request {} chunk error: {:?}", request_id, error);
@@ -352,8 +408,11 @@ async fn encode(mut request: Request, env: Env) -> Result<Response> {
     headers.set("Content-Type", "application/vnd.encodec.ecdc")?;
     headers.set("Cache-Control", "no-store")?;
     headers.set("X-Encodec-Request-Id", &request_id)?;
-    headers.set("X-Encodec-Profile", PROFILE)?;
-    headers.set("X-Encodec-Decoded-Samples", &EXPECTED_FRAMES.to_string())?;
+    headers.set("X-Encodec-Profile", profile.name)?;
+    headers.set(
+        "X-Encodec-Decoded-Samples",
+        &profile.owned_samples.to_string(),
+    )?;
     headers.set(
         "X-Encodec-Decode-Elapsed-Ms",
         &format!("{:.3}", decoded_at - started),
@@ -379,17 +438,17 @@ async fn encode(mut request: Request, env: Env) -> Result<Response> {
     Ok(Response::from_bytes(ecdc)?.with_headers(headers))
 }
 
-async fn get_runtime() -> std::result::Result<Rc<Runtime>, JsValue> {
-    if let Some(runtime) = RUNTIME.with(|cell| cell.borrow().clone()) {
+async fn get_runtime(profile: &'static ProfileSpec) -> std::result::Result<Rc<Runtime>, JsValue> {
+    if let Some(runtime) = RUNTIMES.with(|cell| cell.borrow().get(profile.name).cloned()) {
         return Ok(runtime);
     }
 
-    let promise = RUNTIME_PROMISE.with(|cell| {
-        if let Some(promise) = cell.borrow().clone() {
+    let promise = RUNTIME_PROMISES.with(|cell| {
+        if let Some(promise) = cell.borrow().get(profile.name).cloned() {
             promise
         } else {
             let future = async {
-                let model = Uint8Array::from(MODEL_BYTES);
+                let model = Uint8Array::from(profile.model_bytes);
                 let options = Object::new();
                 let providers = Array::new();
                 providers.push(&JsValue::from_str("wasm"));
@@ -411,88 +470,206 @@ async fn get_runtime() -> std::result::Result<Rc<Runtime>, JsValue> {
                     session,
                     instance_id: random_id(),
                 });
-                RUNTIME.with(|cell| *cell.borrow_mut() = Some(runtime));
+                RUNTIMES.with(|cell| {
+                    cell.borrow_mut().insert(profile.name, runtime);
+                });
                 Ok(JsValue::UNDEFINED)
             };
             let promise = wasm_bindgen_futures::future_to_promise(future);
-            *cell.borrow_mut() = Some(promise.clone());
+            cell.borrow_mut().insert(profile.name, promise.clone());
             promise
         }
     });
 
     if let Err(error) = JsFuture::from(promise).await {
-        RUNTIME_PROMISE.with(|cell| *cell.borrow_mut() = None);
+        RUNTIME_PROMISES.with(|cell| {
+            cell.borrow_mut().remove(profile.name);
+        });
         return Err(error);
     }
 
-    RUNTIME
-        .with(|cell| cell.borrow().clone())
+    RUNTIMES
+        .with(|cell| cell.borrow().get(profile.name).cloned())
         .ok_or_else(|| JsValue::from_str("runtime initialisation completed without a runtime"))
 }
 
-fn runtime_exists() -> bool {
-    RUNTIME.with(|cell| cell.borrow().is_some())
-        || RUNTIME_PROMISE.with(|cell| cell.borrow().is_some())
+fn runtime_exists(profile: &'static str) -> bool {
+    RUNTIMES.with(|cell| cell.borrow().contains_key(profile))
+        || RUNTIME_PROMISES.with(|cell| cell.borrow().contains_key(profile))
 }
 
-fn decode_packet_bundle(input: &[u8]) -> std::result::Result<Vec<f32>, String> {
+fn requested_profile(request: &Request) -> Option<&'static ProfileSpec> {
+    let profile = request
+        .headers()
+        .get("X-Encodec-Profile")
+        .ok()
+        .flatten()
+        .unwrap_or_else(|| DEFAULT_PROFILE.to_string());
+    match profile.as_str() {
+        "encodec_48khz_12kbps_1333ms" => Some(&PROFILE_1333),
+        "encodec_48khz_12kbps_1800ms" => Some(&PROFILE_1800),
+        _ => None,
+    }
+}
+
+fn read_u32_be(input: &[u8], offset: usize) -> std::result::Result<u32, String> {
+    if input.len() < offset + 4 {
+        return Err("truncated u32".to_string());
+    }
+    Ok(u32::from_be_bytes(
+        input[offset..offset + 4]
+            .try_into()
+            .map_err(|_| "invalid u32")?,
+    ))
+}
+
+struct SoundkitV2Frame {
+    payload_offset: usize,
+    payload_size: usize,
+    frame_count: usize,
+    sample_rate: u32,
+    channels: usize,
+    encoding: u32,
+}
+
+fn parse_soundkit_v2_frame(
+    input: &[u8],
+    start_offset: usize,
+) -> std::result::Result<Option<SoundkitV2Frame>, String> {
+    if input.len() < start_offset + 8 {
+        return Ok(None);
+    }
+    let word = read_u32_be(input, start_offset)?;
+    let magic = (word >> 26) & 0x3f;
+    if magic != SOUNDKIT_V2_MAGIC {
+        return Ok(None);
+    }
+    let version = (word >> 24) & 0x03;
+    if version != SOUNDKIT_V2_VERSION {
+        return Err(format!("unsupported SoundKit v2 frame version {}", version));
+    }
+    let flags = (word >> 16) & 0xff;
+    let encoding = (word >> 12) & 0x0f;
+    let sample_rate_index = ((word >> 8) & 0x0f) as usize;
+    let sample_rate = SOUNDKIT_V2_SAMPLE_RATES
+        .get(sample_rate_index)
+        .copied()
+        .unwrap_or_default();
+    let channels = (((word >> 3) & 0x1f) + 1) as usize;
+    let size_word = read_u32_be(input, start_offset + 4)?;
+    let mut payload_size = ((size_word >> 16) & 0xffff) as usize;
+    let mut frame_count = (size_word & 0xffff) as usize;
+    let mut offset = start_offset + 8;
+
+    if (flags & SOUNDKIT_V2_FLAG_EXTENDED_SIZES) != 0 {
+        payload_size = read_u32_be(input, offset)? as usize;
+        frame_count = read_u32_be(input, offset + 4)? as usize;
+        offset += 8;
+    }
+    if (flags & SOUNDKIT_V2_FLAG_ID_PRESENT) != 0 {
+        offset += if (flags & SOUNDKIT_V2_FLAG_ID_U64) != 0 {
+            8
+        } else {
+            4
+        };
+    }
+    if (flags & SOUNDKIT_V2_FLAG_PTS_PRESENT) != 0 {
+        offset += 8;
+    }
+    if input.len() < offset || input.len() - offset < payload_size {
+        return Err("truncated SoundKit v2 frame payload".to_string());
+    }
+    Ok(Some(SoundkitV2Frame {
+        payload_offset: offset,
+        payload_size,
+        frame_count,
+        sample_rate,
+        channels,
+        encoding,
+    }))
+}
+
+fn decode_soundkit_opus_stream(
+    input: &[u8],
+    profile: &ProfileSpec,
+) -> std::result::Result<Vec<f32>, String> {
     let mut decoder =
         OpusDecoder::new(SAMPLE_RATE as i32, CHANNELS).map_err(|error| error.to_string())?;
     let mut cursor = 0usize;
-    let mut output = Vec::with_capacity(EXPECTED_FRAMES * CHANNELS);
+    let mut interleaved = Vec::with_capacity(profile.owned_samples * CHANNELS);
     let mut packet_count = 0usize;
 
     while cursor < input.len() {
-        if input.len() - cursor < 4 {
-            return Err(format!(
-                "truncated packet length at packet {}",
-                packet_count
-            ));
+        let Some(frame) = parse_soundkit_v2_frame(input, cursor)? else {
+            return Err(format!("invalid SoundKit v2 frame at byte {}", cursor));
+        };
+        if frame.encoding != SOUNDKIT_V2_ENCODING_OPUS
+            || frame.sample_rate != SAMPLE_RATE
+            || frame.channels != CHANNELS
+        {
+            return Err("SoundKit frame parameters do not match the encoder profile".to_string());
         }
-        let packet_len = u32::from_be_bytes(
-            input[cursor..cursor + 4]
-                .try_into()
-                .map_err(|_| "invalid packet length")?,
-        ) as usize;
-        cursor += 4;
-        if packet_len == 0 || input.len() - cursor < packet_len {
-            return Err(format!(
-                "invalid packet {} length {}",
-                packet_count, packet_len
-            ));
-        }
+        let packet_start = frame.payload_offset;
+        let packet_end = frame.payload_offset + frame.payload_size;
         let decoded = decoder
-            .decode_i16(&input[cursor..cursor + packet_len], false)
+            .decode_i16(&input[packet_start..packet_end], false)
             .map_err(|error| error.to_string())?;
-        cursor += packet_len;
-        for sample in decoded {
-            output.push(sample as f32 / 32768.0);
-            if output.len() > EXPECTED_FRAMES * CHANNELS {
+        let decoded_frames = decoded.len() / CHANNELS;
+        if frame.frame_count > 0 && decoded_frames < frame.frame_count {
+            return Err(
+                "Opus packet decoded fewer frames than the SoundKit header declares".to_string(),
+            );
+        }
+        let keep_frames = frame.frame_count.min(decoded_frames);
+        for sample in decoded.iter().take(keep_frames * CHANNELS) {
+            interleaved.push(*sample as f32 / 32768.0);
+            if interleaved.len() > profile.owned_samples * CHANNELS {
                 return Err("decoded PCM exceeds the fixed segment length".to_string());
             }
         }
+        cursor = packet_end;
         packet_count += 1;
     }
 
     if packet_count == 0 {
-        return Err("packet bundle contains no packets".to_string());
+        return Err("SoundKit Opus stream contains no frames".to_string());
     }
-    if output.len() != EXPECTED_FRAMES * CHANNELS {
+    if interleaved.len() != profile.owned_samples * CHANNELS {
         return Err(format!(
             "decoded {} samples, expected {}",
-            output.len(),
-            EXPECTED_FRAMES * CHANNELS
+            interleaved.len(),
+            profile.owned_samples * CHANNELS
         ));
     }
-    if output.iter().any(|sample| !sample.is_finite()) {
+    if interleaved.iter().any(|sample| !sample.is_finite()) {
         return Err("decoded PCM contains non-finite samples".to_string());
     }
-    Ok(output)
+
+    let mut planar = vec![0.0f32; profile.owned_samples * CHANNELS];
+    for frame in 0..profile.owned_samples {
+        for channel in 0..CHANNELS {
+            planar[(channel * profile.owned_samples) + frame] =
+                interleaved[(frame * CHANNELS) + channel];
+        }
+    }
+    Ok(planar)
+}
+
+fn add_fixed_context(owned_pcm: &[f32], profile: &ProfileSpec) -> Vec<f32> {
+    let mut pcm = vec![0.0f32; profile.model_samples * CHANNELS];
+    for channel in 0..CHANNELS {
+        let source_base = channel * profile.owned_samples;
+        let target_base = channel * profile.model_samples + CONTEXT_SAMPLES;
+        pcm[target_base..target_base + profile.owned_samples]
+            .copy_from_slice(&owned_pcm[source_base..source_base + profile.owned_samples]);
+    }
+    pcm
 }
 
 async fn run_inference(
     session: &InferenceSession,
     pcm: &[f32],
+    profile: &ProfileSpec,
 ) -> std::result::Result<(Vec<u16>, f32, usize), JsValue> {
     let input_names = session.input_names();
     let input_name = input_names
@@ -503,7 +680,7 @@ async fn run_inference(
     let dims = Array::new();
     dims.push(&JsValue::from_f64(1.0));
     dims.push(&JsValue::from_f64(CHANNELS as f64));
-    dims.push(&JsValue::from_f64(EXPECTED_FRAMES as f64));
+    dims.push(&JsValue::from_f64(profile.model_samples as f64));
     let tensor = Tensor::new_tensor("float32", data, dims);
     let feeds = Object::new();
     Reflect::set(&feeds, &JsValue::from_str(&input_name), tensor.as_ref())?;
@@ -569,6 +746,11 @@ async fn run_inference(
     let scale = scale.ok_or_else(|| JsValue::from_str("model did not return a scalar scale"))?;
     if frame_length == 0 {
         return Err(JsValue::from_str("model returned an invalid frame length"));
+    }
+    if frame_length != profile.frame_length {
+        return Err(JsValue::from_str(
+            "model returned an unexpected frame length",
+        ));
     }
     Ok((codes, scale, frame_length))
 }

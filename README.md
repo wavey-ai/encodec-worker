@@ -26,7 +26,7 @@ with the real fixed bundle:
 ## Request
 
 ```bash
-curl -X POST http://localhost:8787/encode/ecdc \
+curl -X POST http://localhost:8787/encode \
   -H 'Content-Type: application/vnd.soundkit.opus-packets' \
   -H 'X-Encodec-Profile: encodec_48khz_12kbps_1800ms' \
   -H 'X-Encodec-Expected-Samples: 86400' \
