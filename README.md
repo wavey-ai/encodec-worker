@@ -1,3 +1,5 @@
+** ON HOLD TOO MUCH RAM **
+
 # encodec-worker
 
 Rust-first Cloudflare Worker proof of concept for one fixed segment:
